@@ -1,25 +1,23 @@
-# Save as .github/workflows/uefi-port.yml in a PRIVATE fork of
-#   https://github.com/Project-Silicium/Mu-Silicium
+# Save as .github/workflows/uefi-port.yml in a PRIVATE copy of a Mu-Silicium based UEFI repo.
 # (private because the extracted Binaries/ come from your phone's firmware and are vendor files)
 #
 # Commit these before running it:
 #   .ci/silicium_port.py        the script I wrote (silicium_port.py)
-#   port-input/device-tree.dtb  adb pull /sys/firmware/fdt   (check chosen/bootargs for your serial number)
-#   port-input/xbl.img          your phone's xbl partition (guide: dd if=/dev/block/by-name/xbl* ...)
-#                               The partition may be named xbl_a; the same file is in Motorola's stock
-#                               firmware package, but I have not verified that.
+#   port-input/device-tree.dtb  device tree from the phone, with serial/MAC blanked
+#   port-input/xbl.img          the phone's xbl_a partition
 #
-# What it does, following Project Silicium's "Adding Devices / Adding SoCs" guides:
-#   1. extracts UEFI binaries + uefiplat.cfg from xbl.img with UEFIReader
-#   2. copies a SIMILAR existing platform and SoC package, renames them, new GUID
-#   3. regenerates the memory map, config map, GIC/timer/core PCDs and FD values from your files
-#   4. commits the result to branch port/<codename> and tries a DEBUG build
+# What it does:
+#   0. looks for an existing platform for the codename. If one exists it skips porting and just builds.
+#   1. otherwise picks the CLOSEST existing platform automatically (same SoC family first, scored by
+#      a preference list), and its SoC package. You can still override both with inputs.
+#   2. extracts UEFI binaries + uefiplat.cfg from xbl.img with UEFIReader
+#   3. copies and renames that platform and SoC package, new GUID
+#   4. regenerates the memory map, config map, GIC/timer/core PCDs and FD values from your files
+#   5. commits to branch port/<codename> and tries a DEBUG build
 #
-# What it does NOT do (guide steps that need eyes or the phone):
-#   - APRIORI.inc / DXE.inc / RAW.inc order (UEFITool), SmBios + cache sizes, ACPI, boot image script,
-#     the SoC's timer PCDs cross-check, and every boot test. Expect the first builds to fail or
-#     the image not to boot. The branch is your starting point to fix those.
-# The guides are marked outdated by the project, so paths may differ. Untested on the real repo.
+# NOT done (needs eyes or the phone): APRIORI/DXE/RAW order (UEFITool), SmBios, cache sizes, ACPI,
+# boot image script, boot tests. Expect the first builds to fail; the branch is the starting point.
+# Project Silicium marks its porting guides as outdated, so paths may differ. Untested on the real repo.
 
 name: Port and build UEFI
 
@@ -27,20 +25,20 @@ on:
   workflow_dispatch:
     inputs:
       codename:
-        description: "Codename for the new platform"
+        description: "Codename for the platform"
         default: "kiev"
       vendor:
         description: "Vendor folder under Platforms/"
         default: "Motorola"
       soc:
-        description: "SoC name for the new SoC package"
+        description: "SoC name"
         default: "SM7225"
       base_platform:
-        description: "Existing similar platform dir to copy, e.g. Platforms/Xiaomi/limePkg"
-        required: true
+        description: "Platform dir to copy (leave 'auto' to pick the closest)"
+        default: "auto"
       base_soc:
-        description: "Existing similar SoC dir to copy, e.g. Silicon/Qualcomm/SM7125Pkg"
-        required: true
+        description: "SoC dir to copy (leave 'auto' to follow the chosen platform)"
+        default: "auto"
 
 permissions:
   contents: write
@@ -49,8 +47,8 @@ env:
   CODE: ${{ inputs.codename }}
   VENDOR: ${{ inputs.vendor }}
   SOC: ${{ inputs.soc }}
-  BASE_PLAT: ${{ inputs.base_platform }}
-  BASE_SOC: ${{ inputs.base_soc }}
+  IN_PLAT: ${{ inputs.base_platform }}
+  IN_SOC: ${{ inputs.base_soc }}
 
 jobs:
   port:
@@ -65,15 +63,83 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Tools
+      - name: Tools and input check
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends device-tree-compiler uuid-runtime p7zip-full
-          for f in .ci/silicium_port.py port-input/device-tree.dtb port-input/xbl.img "$BASE_PLAT" "$BASE_SOC"; do
+          for f in .ci/silicium_port.py port-input/device-tree.dtb port-input/xbl.img; do
             test -e "$f" || { echo "::error::Missing $f"; exit 1; }
           done
 
+      - name: Find an existing platform, or pick the closest one
+        run: |
+          python3 -I - <<'PY'
+          import glob, os, re, sys
+
+          code = os.environ["CODE"].lower()
+          soc = os.environ["SOC"]
+          env = open(os.environ["GITHUB_ENV"], "a")
+
+          def pkg_dir(d):
+              while d and not d.endswith("Pkg") and d.count("/") > 1:
+                  d = os.path.dirname(d)
+              return d
+
+          # 0. already exists?
+          existing = [p for p in glob.glob("Platforms/*/*") if code in p.lower() and os.path.isdir(p)]
+          if existing:
+              print("Existing platform found:", existing[0])
+              env.write("EXISTING=true\nNEW_PLAT=%s\n" % existing[0])
+              sys.exit(0)
+
+          # 1. index all platforms by the SoC their .dsc includes
+          rows = []
+          for dsc in glob.glob("Platforms/**/*.dsc", recursive=True):
+              t = open(dsc, errors="replace").read()
+              m = re.search(r"!include\s+\S*?((?:SM|SDM|MSM)\d+)\S*\.dsc\.inc", t)
+              if m:
+                  d = pkg_dir(os.path.dirname(dsc))
+                  if os.path.isdir(d):
+                      rows.append((m.group(1), d))
+          if not rows:
+              print("::error::No platforms with a recognizable SoC include found. Layout:")
+              os.system("find . -maxdepth 3 -type d -name '*Pkg' | sort | head -100")
+              sys.exit(1)
+
+          # 2. closest SoC first (same family as SM7225 = Snapdragon 750G / lito)
+          pref = [soc, "SM7250", "SM7125", "SM7150", "SM7325", "SM6350", "SM6375",
+                  "SM6225", "SM6125", "SM6115", "SM8250", "SM8150"]
+          plat, base_soc_name = None, None
+          if os.environ["IN_PLAT"] not in ("", "auto"):
+              plat = os.environ["IN_PLAT"]
+              base_soc_name = next((s for s, d in rows if d == plat), None)
+          else:
+              for want in pref:
+                  hit = next((d for s, d in rows if s == want), None)
+                  if hit:
+                      plat, base_soc_name = hit, want
+                      break
+              if not plat:
+                  base_soc_name, plat = rows[0]
+
+          # 3. its SoC package
+          if os.environ["IN_SOC"] not in ("", "auto"):
+              socdir = os.environ["IN_SOC"]
+          else:
+              cands = ["Silicon/Qualcomm/%sPkg" % base_soc_name] + sorted(glob.glob("Silicon/Qualcomm/*%s*" % base_soc_name))
+              socdir = next((c for c in cands if os.path.isdir(c)), None)
+          if not socdir or not os.path.isdir(plat):
+              print("::error::Could not resolve base dirs. plat=%s soc=%s" % (plat, socdir))
+              os.system("find . -maxdepth 3 -type d -name '*Pkg' | sort | head -100")
+              sys.exit(1)
+
+          print("Chosen base platform:", plat, "(SoC %s)" % base_soc_name)
+          print("Chosen base SoC dir :", socdir)
+          env.write("EXISTING=false\nBASE_PLAT=%s\nBASE_SOC=%s\n" % (plat, socdir))
+          PY
+
       - name: Extract binaries and uefiplat.cfg with UEFIReader
+        if: env.EXISTING != 'true'
         run: |
           git clone --depth 1 https://github.com/WOA-Project/UEFIReader.git /tmp/UEFIReader
           dotnet build /tmp/UEFIReader/UEFIReader.sln -c Release
@@ -84,28 +150,27 @@ jobs:
           find /tmp/xbl-out -name uefiplat.cfg | grep -q . || { echo "::error::uefiplat.cfg not found in UEFIReader output"; exit 1; }
 
       - name: Copy and rename the base platform
+        if: env.EXISTING != 'true'
         run: |
           OLD=$(basename "$BASE_PLAT" | sed 's/Pkg$//')
           NEW_PLAT="Platforms/$VENDOR/${CODE}Pkg"
           mkdir -p "Platforms/$VENDOR"
           cp -r "$BASE_PLAT" "$NEW_PLAT"
-          # rename files, then contents
           find "$NEW_PLAT" -depth -name "*$OLD*" | while read -r p; do
             mv "$p" "$(dirname "$p")/$(basename "$p" | sed "s/$OLD/$CODE/g")"
           done
           grep -rIl "$OLD" "$NEW_PLAT" | xargs -r sed -i "s/${OLD}Pkg/${CODE}Pkg/g; s/$OLD/$CODE/g"
-          # fresh GUID
           DSC=$(find "$NEW_PLAT" -name "*.dsc" | head -1)
           OLDGUID=$(grep -m1 -oP 'PLATFORM_GUID\s*=\s*\K[0-9A-Fa-f-]+' "$DSC")
           NEWGUID=$(uuidgen | tr a-z A-Z)
           sed -i "s/$OLDGUID/$NEWGUID/" "$DSC"
           echo "old=$OLD guid $OLDGUID -> $NEWGUID" | tee -a port.log
-          # config file
           CONF_OLD="Resources/Configs/$OLD.conf"
-          test -f "$CONF_OLD" && cp "$CONF_OLD" "Resources/Configs/$CODE.conf" || echo "::warning::$CONF_OLD not found; create Resources/Configs/$CODE.conf by hand"
+          if [ -f "$CONF_OLD" ]; then cp "$CONF_OLD" "Resources/Configs/$CODE.conf"; else echo "::warning::$CONF_OLD not found; create Resources/Configs/$CODE.conf by hand"; fi
           echo "NEW_PLAT=$NEW_PLAT" >> "$GITHUB_ENV"
 
       - name: Copy and rename the base SoC package
+        if: env.EXISTING != 'true'
         run: |
           OLDSOC=$(basename "$BASE_SOC" | sed 's/Pkg$//')
           NEW_SOC="Silicon/Qualcomm/${SOC}Pkg"
@@ -116,33 +181,35 @@ jobs:
             done
             grep -rIl "$OLDSOC" "$NEW_SOC" | xargs -r sed -i "s/$OLDSOC/$SOC/g"
           fi
-          # platform must point at the new SoC include
-          grep -rIl "${OLDSOC}Pkg\|$OLDSOC.dsc.inc" "$NEW_PLAT" | xargs -r sed -i "s/$OLDSOC/$SOC/g"
+          grep -rIl "$OLDSOC" "$NEW_PLAT" | xargs -r sed -i "s/$OLDSOC/$SOC/g"
           echo "NEW_SOC=$NEW_SOC" >> "$GITHUB_ENV"
 
       - name: Place binaries and device tree
+        if: env.EXISTING != 'true'
         run: |
           mkdir -p "Binaries/$CODE" Resources/DTBs "$NEW_PLAT/FdtBlob"
           cp -r /tmp/xbl-out/. "Binaries/$CODE/"
-          test -f Binaries/CleanUp.sh && (cd Binaries && bash CleanUp.sh) || true
+          if [ -f Binaries/CleanUp.sh ]; then (cd Binaries && bash CleanUp.sh) || true; fi
           dtc -I dtb -O dts -q port-input/device-tree.dtb > "Resources/DTBs/$CODE.dts" || true
           cp port-input/device-tree.dtb "Resources/DTBs/$CODE.dtb"
           cp port-input/device-tree.dtb "$NEW_PLAT/FdtBlob/$CODE.dtb"
 
       - name: Generate memory map, config map, SoC PCDs, FD values
+        if: env.EXISTING != 'true'
         run: |
           MM=$(find "$NEW_PLAT" -name DeviceMemoryMapLib.c | head -1)
           CM=$(find "$NEW_PLAT" -name DeviceConfigurationMapLib.c | head -1)
           SOCINC=$(find "$NEW_SOC" -name "*.dsc.inc" | head -1)
           CFG=$(find /tmp/xbl-out -name uefiplat.cfg | head -1)
           ARGS=""
-          test -f "Resources/Configs/$CODE.conf" && ARGS="--device-conf Resources/Configs/$CODE.conf"
+          if [ -f "Resources/Configs/$CODE.conf" ]; then ARGS="--device-conf Resources/Configs/$CODE.conf"; fi
           python3 -I .ci/silicium_port.py --dts "Resources/DTBs/$CODE.dts" --cfg "$CFG" \
             --memmap-template "$MM" --confmap-template "$CM" \
             --out-memmap "$MM" --out-confmap "$CM" \
             --soc-dsc-inc "$SOCINC" $ARGS --report port-report.md | tee -a port.log
 
       - name: Commit to branch port/${{ inputs.codename }}
+        if: env.EXISTING != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -152,7 +219,6 @@ jobs:
           git push -f origin "port/$CODE"
 
       - name: Try a DEBUG build
-        id: build
         continue-on-error: true
         run: |
           ./setup_env.sh -p apt
