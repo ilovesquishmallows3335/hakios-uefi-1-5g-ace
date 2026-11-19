@@ -1,23 +1,23 @@
-# Save as .github/workflows/uefi-port.yml in a PRIVATE copy of a Mu-Silicium based UEFI repo.
-# (private because the extracted Binaries/ come from your phone's firmware and are vendor files)
+# Save as .github/workflows/uefi-port.yml in a PRIVATE repo of yours.
 #
-# Commit these before running it:
+# Your repo only has to hold the INPUT files:
 #   .ci/silicium_port.py        the script I wrote (silicium_port.py)
 #   port-input/device-tree.dtb  device tree from the phone, with serial/MAC blanked
 #   port-input/xbl.img          the phone's xbl_a partition
 #
-# What it does:
-#   0. looks for an existing platform for the codename. If one exists it skips porting and just builds.
-#   1. otherwise picks the CLOSEST existing platform automatically (same SoC family first, scored by
-#      a preference list), and its SoC package. You can still override both with inputs.
+# The workflow checks out a real UEFI source repo (default: Project-Silicium/Mu-Silicium) into mu/,
+# so it always has platforms to copy from, whatever your own repo contains. Then it:
+#   0. looks for an existing platform for the codename; if found, it skips porting and just builds
+#   1. otherwise picks the CLOSEST existing platform (same SoC family first) and its SoC package
 #   2. extracts UEFI binaries + uefiplat.cfg from xbl.img with UEFIReader
 #   3. copies and renames that platform and SoC package, new GUID
-#   4. regenerates the memory map, config map, GIC/timer/core PCDs and FD values from your files
-#   5. commits to branch port/<codename> and tries a DEBUG build
+#   4. regenerates memory map, config map, GIC/timer/core PCDs, FD values from your files
+#   5. tries a DEBUG build, and uploads the generated tree + logs as an artifact
 #
 # NOT done (needs eyes or the phone): APRIORI/DXE/RAW order (UEFITool), SmBios, cache sizes, ACPI,
-# boot image script, boot tests. Expect the first builds to fail; the branch is the starting point.
-# Project Silicium marks its porting guides as outdated, so paths may differ. Untested on the real repo.
+# boot image script, boot tests. Expect the first builds to fail; the artifact is your starting point.
+# Project Silicium marks its porting guides outdated, so paths may differ. Untested on the real repo.
+# The artifact contains vendor binaries from your xbl: keep this repo private.
 
 name: Port and build UEFI
 
@@ -33,15 +33,18 @@ on:
       soc:
         description: "SoC name"
         default: "SM7225"
+      uefi_repo:
+        description: "UEFI source repo to build from"
+        default: "Project-Silicium/Mu-Silicium"
       base_platform:
-        description: "Platform dir to copy (leave 'auto' to pick the closest)"
+        description: "Platform dir to copy, relative to the UEFI repo ('auto' = closest)"
         default: "auto"
       base_soc:
-        description: "SoC dir to copy (leave 'auto' to follow the chosen platform)"
+        description: "SoC dir to copy ('auto' = follow the chosen platform)"
         default: "auto"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CODE: ${{ inputs.codename }}
@@ -54,9 +57,20 @@ jobs:
   port:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: mu
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out your repo (the inputs)
+        uses: actions/checkout@v4
         with:
+          path: inputs
+
+      - name: Check out the UEFI source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.uefi_repo }}
+          path: mu
           submodules: recursive
 
       - uses: actions/setup-dotnet@v4
@@ -65,11 +79,15 @@ jobs:
 
       - name: Tools and input check
         run: |
+          for f in .ci/silicium_port.py port-input/device-tree.dtb port-input/xbl.img; do
+            test -e "../inputs/$f" || { echo "::error::Missing $f in your repo"; exit 1; }
+          done
+          mkdir -p .ci port-input
+          cp ../inputs/.ci/silicium_port.py .ci/
+          cp ../inputs/port-input/device-tree.dtb ../inputs/port-input/xbl.img port-input/
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends device-tree-compiler uuid-runtime p7zip-full
-          for f in .ci/silicium_port.py port-input/device-tree.dtb port-input/xbl.img; do
-            test -e "$f" || { echo "::error::Missing $f"; exit 1; }
-          done
+          echo "Top level of the UEFI repo:"; ls
 
       - name: Find an existing platform, or pick the closest one
         run: |
@@ -85,14 +103,12 @@ jobs:
                   d = os.path.dirname(d)
               return d
 
-          # 0. already exists?
           existing = [p for p in glob.glob("Platforms/*/*") if code in p.lower() and os.path.isdir(p)]
           if existing:
               print("Existing platform found:", existing[0])
               env.write("EXISTING=true\nNEW_PLAT=%s\n" % existing[0])
               sys.exit(0)
 
-          # 1. index all platforms by the SoC their .dsc includes
           rows = []
           for dsc in glob.glob("Platforms/**/*.dsc", recursive=True):
               t = open(dsc, errors="replace").read()
@@ -102,11 +118,10 @@ jobs:
                   if os.path.isdir(d):
                       rows.append((m.group(1), d))
           if not rows:
-              print("::error::No platforms with a recognizable SoC include found. Layout:")
-              os.system("find . -maxdepth 3 -type d -name '*Pkg' | sort | head -100")
+              print("::error::No platforms with a recognizable SoC include found in this repo. Layout:")
+              os.system("ls; find . -maxdepth 3 -type d -name '*Pkg' | sort | head -100")
               sys.exit(1)
 
-          # 2. closest SoC first (same family as SM7225 = Snapdragon 750G / lito)
           pref = [soc, "SM7250", "SM7125", "SM7150", "SM7325", "SM6350", "SM6375",
                   "SM6225", "SM6125", "SM6115", "SM8250", "SM8150"]
           plat, base_soc_name = None, None
@@ -122,7 +137,6 @@ jobs:
               if not plat:
                   base_soc_name, plat = rows[0]
 
-          # 3. its SoC package
           if os.environ["IN_SOC"] not in ("", "auto"):
               socdir = os.environ["IN_SOC"]
           else:
@@ -208,32 +222,29 @@ jobs:
             --out-memmap "$MM" --out-confmap "$CM" \
             --soc-dsc-inc "$SOCINC" $ARGS --report port-report.md | tee -a port.log
 
-      - name: Commit to branch port/${{ inputs.codename }}
-        if: env.EXISTING != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "port/$CODE"
-          git add -A Platforms Silicon Resources Binaries port-report.md
-          git commit -m "Generated first-pass $CODE port (needs manual APRIORI/DXE/SmBios/ACPI work)"
-          git push -f origin "port/$CODE"
-
       - name: Try a DEBUG build
         continue-on-error: true
         run: |
           ./setup_env.sh -p apt
           ./build_uefi.sh -d "$CODE" -r DEBUG 2>&1 | tee build.log
 
-      - name: Upload report, logs, image
+      - name: Pack the generated tree
+        if: always()
+        run: |
+          tar czf kiev-port-tree.tgz \
+            "Platforms/$VENDOR/${CODE}Pkg" "Silicon/Qualcomm/${SOC}Pkg" \
+            "Resources/Configs/$CODE.conf" "Resources/DTBs/$CODE.dts" "Resources/DTBs/$CODE.dtb" \
+            "Binaries/$CODE" port-report.md 2>/dev/null || true
+
+      - name: Upload report, logs, generated tree, image
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: port-${{ inputs.codename }}
           path: |
-            port-report.md
-            port.log
-            build.log
-            **/*.img
-            **/*.tar
-            **/*.bin
+            mu/port-report.md
+            mu/port.log
+            mu/build.log
+            mu/kiev-port-tree.tgz
+            mu/**/*.img
           retention-days: 14
