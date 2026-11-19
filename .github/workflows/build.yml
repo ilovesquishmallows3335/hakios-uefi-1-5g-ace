@@ -1,22 +1,20 @@
 # Save as .github/workflows/uefi-port.yml in a PRIVATE repo of yours.
 #
 # Your repo only has to hold the INPUT files:
-#   .ci/silicium_port.py        the script I wrote (silicium_port.py)
+#   .ci/silicium_port.py        the script (silicium_port.py)
 #   port-input/device-tree.dtb  device tree from the phone, with serial/MAC blanked
 #   port-input/xbl.img          the phone's xbl_a partition
 #
-# The workflow checks out a real UEFI source repo (default: Project-Silicium/Mu-Silicium) into mu/,
-# so it always has platforms to copy from, whatever your own repo contains. Then it:
-#   0. looks for an existing platform for the codename; if found, it skips porting and just builds
-#   1. otherwise picks the CLOSEST existing platform (same SoC family first) and its SoC package
-#   2. extracts UEFI binaries + uefiplat.cfg from xbl.img with UEFIReader
-#   3. copies and renames that platform and SoC package, new GUID
-#   4. regenerates memory map, config map, GIC/timer/core PCDs, FD values from your files
-#   5. tries a DEBUG build, and uploads the generated tree + logs as an artifact
+# Modes (picked automatically):
+#   existing  a platform for the codename already exists -> skip porting, just build
+#   copy      a similar platform (same SoC family first) exists -> copy + rename it
+#   scaffold  NO similar platform exists -> create an empty platform dir from scratch
+# The SoC package works the same way: keep it if it exists, copy the closest one,
+# or scaffold a new Silicon/Qualcomm/<SoC>Pkg from scratch if there is nothing to copy.
 #
-# NOT done (needs eyes or the phone): APRIORI/DXE/RAW order (UEFITool), SmBios, cache sizes, ACPI,
-# boot image script, boot tests. Expect the first builds to fail; the artifact is your starting point.
-# Project Silicium marks its porting guides outdated, so paths may differ. Untested on the real repo.
+# NOT done (needs eyes or the phone): APRIORI/DXE/RAW order (UEFITool), SmBios, cache sizes,
+# ACPI, boot image script, boot tests. Scaffolded trees are skeletons: expect the first builds
+# to fail; the artifact is your starting point.
 # The artifact contains vendor binaries from your xbl: keep this repo private.
 
 name: Port and build UEFI
@@ -37,10 +35,10 @@ on:
         description: "UEFI source repo to build from"
         default: "Project-Silicium/Mu-Silicium"
       base_platform:
-        description: "Platform dir to copy, relative to the UEFI repo ('auto' = closest)"
+        description: "Platform dir to copy, relative to the UEFI repo ('auto' = closest, scaffold if none)"
         default: "auto"
       base_soc:
-        description: "SoC dir to copy ('auto' = follow the chosen platform)"
+        description: "SoC dir to copy ('auto' = follow the chosen platform, scaffold if none)"
         default: "auto"
 
 permissions:
@@ -89,13 +87,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends device-tree-compiler uuid-runtime p7zip-full
           echo "Top level of the UEFI repo:"; ls
 
-      - name: Find an existing platform, or pick the closest one
+      - name: Decide mode (existing / copy / scaffold)
         run: |
           python3 -I - <<'PY'
-          import glob, os, re, sys
+          import glob, os, re
 
           code = os.environ["CODE"].lower()
           soc = os.environ["SOC"]
+          vendor = os.environ["VENDOR"]
           env = open(os.environ["GITHUB_ENV"], "a")
 
           def pkg_dir(d):
@@ -106,8 +105,8 @@ jobs:
           existing = [p for p in glob.glob("Platforms/*/*") if code in p.lower() and os.path.isdir(p)]
           if existing:
               print("Existing platform found:", existing[0])
-              env.write("EXISTING=true\nNEW_PLAT=%s\n" % existing[0])
-              sys.exit(0)
+              env.write("MODE=existing\nNEW_PLAT=%s\n" % existing[0])
+              raise SystemExit(0)
 
           rows = []
           for dsc in glob.glob("Platforms/**/*.dsc", recursive=True):
@@ -117,18 +116,15 @@ jobs:
                   d = pkg_dir(os.path.dirname(dsc))
                   if os.path.isdir(d):
                       rows.append((m.group(1), d))
-          if not rows:
-              print("::error::No platforms with a recognizable SoC include found in this repo. Layout:")
-              os.system("ls; find . -maxdepth 3 -type d -name '*Pkg' | sort | head -100")
-              sys.exit(1)
 
-          pref = [soc, "SM7250", "SM7125", "SM7150", "SM7325", "SM6350", "SM6375",
-                  "SM6225", "SM6125", "SM6115", "SM8250", "SM8150"]
-          plat, base_soc_name = None, None
+          plat, base_soc_name = "", ""
           if os.environ["IN_PLAT"] not in ("", "auto"):
-              plat = os.environ["IN_PLAT"]
-              base_soc_name = next((s for s, d in rows if d == plat), None)
-          else:
+              if os.path.isdir(os.environ["IN_PLAT"]):
+                  plat = os.environ["IN_PLAT"]
+                  base_soc_name = next((s for s, d in rows if d == plat), "")
+          elif rows:
+              pref = [soc, "SM7250", "SM7125", "SM7150", "SM7325", "SM6350", "SM6375",
+                      "SM6225", "SM6125", "SM6115", "SM8250", "SM8150"]
               for want in pref:
                   hit = next((d for s, d in rows if s == want), None)
                   if hit:
@@ -137,23 +133,23 @@ jobs:
               if not plat:
                   base_soc_name, plat = rows[0]
 
+          socdir = ""
           if os.environ["IN_SOC"] not in ("", "auto"):
-              socdir = os.environ["IN_SOC"]
-          else:
+              if os.path.isdir(os.environ["IN_SOC"]):
+                  socdir = os.environ["IN_SOC"]
+          elif base_soc_name:
               cands = ["Silicon/Qualcomm/%sPkg" % base_soc_name] + sorted(glob.glob("Silicon/Qualcomm/*%s*" % base_soc_name))
-              socdir = next((c for c in cands if os.path.isdir(c)), None)
-          if not socdir or not os.path.isdir(plat):
-              print("::error::Could not resolve base dirs. plat=%s soc=%s" % (plat, socdir))
-              os.system("find . -maxdepth 3 -type d -name '*Pkg' | sort | head -100")
-              sys.exit(1)
+              socdir = next((c for c in cands if os.path.isdir(c)), "")
 
-          print("Chosen base platform:", plat, "(SoC %s)" % base_soc_name)
-          print("Chosen base SoC dir :", socdir)
-          env.write("EXISTING=false\nBASE_PLAT=%s\nBASE_SOC=%s\n" % (plat, socdir))
+          mode = "copy" if plat else "scaffold"
+          print("MODE          :", mode)
+          print("Base platform :", plat or "(none -> scaffold new platform dir)")
+          print("Base SoC dir  :", socdir or "(none -> scaffold new SoC dir unless it already exists)")
+          env.write("MODE=%s\nBASE_PLAT=%s\nBASE_SOC=%s\n" % (mode, plat, socdir))
           PY
 
       - name: Extract binaries and uefiplat.cfg with UEFIReader
-        if: env.EXISTING != 'true'
+        if: env.MODE != 'existing'
         run: |
           git clone --depth 1 https://github.com/WOA-Project/UEFIReader.git /tmp/UEFIReader
           dotnet build /tmp/UEFIReader/UEFIReader.sln -c Release
@@ -163,43 +159,159 @@ jobs:
           find /tmp/xbl-out -maxdepth 2 | head -50
           find /tmp/xbl-out -name uefiplat.cfg | grep -q . || { echo "::error::uefiplat.cfg not found in UEFIReader output"; exit 1; }
 
-      - name: Copy and rename the base platform
-        if: env.EXISTING != 'true'
+      # ---------- PLATFORM: copy the closest one, or scaffold a new one ----------
+      - name: Create platform dir (copy or scaffold)
+        if: env.MODE != 'existing'
         run: |
-          OLD=$(basename "$BASE_PLAT" | sed 's/Pkg$//')
           NEW_PLAT="Platforms/$VENDOR/${CODE}Pkg"
-          mkdir -p "Platforms/$VENDOR"
-          cp -r "$BASE_PLAT" "$NEW_PLAT"
-          find "$NEW_PLAT" -depth -name "*$OLD*" | while read -r p; do
-            mv "$p" "$(dirname "$p")/$(basename "$p" | sed "s/$OLD/$CODE/g")"
-          done
-          grep -rIl "$OLD" "$NEW_PLAT" | xargs -r sed -i "s/${OLD}Pkg/${CODE}Pkg/g; s/$OLD/$CODE/g"
-          DSC=$(find "$NEW_PLAT" -name "*.dsc" | head -1)
-          OLDGUID=$(grep -m1 -oP 'PLATFORM_GUID\s*=\s*\K[0-9A-Fa-f-]+' "$DSC")
           NEWGUID=$(uuidgen | tr a-z A-Z)
-          sed -i "s/$OLDGUID/$NEWGUID/" "$DSC"
-          echo "old=$OLD guid $OLDGUID -> $NEWGUID" | tee -a port.log
-          CONF_OLD="Resources/Configs/$OLD.conf"
-          if [ -f "$CONF_OLD" ]; then cp "$CONF_OLD" "Resources/Configs/$CODE.conf"; else echo "::warning::$CONF_OLD not found; create Resources/Configs/$CODE.conf by hand"; fi
+          mkdir -p "Platforms/$VENDOR"
+
+          if [ -d "$NEW_PLAT" ]; then
+            echo "$NEW_PLAT already exists, keeping it"
+          elif [ -n "$BASE_PLAT" ]; then
+            OLD=$(basename "$BASE_PLAT" | sed 's/Pkg$//')
+            cp -r "$BASE_PLAT" "$NEW_PLAT"
+            find "$NEW_PLAT" -depth -name "*$OLD*" | while read -r p; do
+              mv "$p" "$(dirname "$p")/$(basename "$p" | sed "s/$OLD/$CODE/g")"
+            done
+            grep -rIl "$OLD" "$NEW_PLAT" | xargs -r sed -i "s/${OLD}Pkg/${CODE}Pkg/g; s/$OLD/$CODE/g"
+            DSC=$(find "$NEW_PLAT" -name "*.dsc" | head -1)
+            OLDGUID=$(grep -m1 -oP 'PLATFORM_GUID\s*=\s*\K[0-9A-Fa-f-]+' "$DSC")
+            sed -i "s/$OLDGUID/$NEWGUID/" "$DSC"
+            echo "copied $OLD -> $CODE, guid $OLDGUID -> $NEWGUID" | tee -a port.log
+            if [ -f "Resources/Configs/$OLD.conf" ]; then cp "Resources/Configs/$OLD.conf" "Resources/Configs/$CODE.conf"; else echo "::warning::Resources/Configs/$OLD.conf not found"; fi
+          else
+            echo "No similar platform: scaffolding $NEW_PLAT from scratch" | tee -a port.log
+            mkdir -p "$NEW_PLAT/Library/DeviceMemoryMapLib" \
+                     "$NEW_PLAT/Library/DeviceConfigurationMapLib" \
+                     "$NEW_PLAT/Include/Configuration" \
+                     "$NEW_PLAT/FdtBlob" "Resources/Configs"
+
+            cat > "$NEW_PLAT/$CODE.dsc" <<EOF
+          [Defines]
+            PLATFORM_NAME                  = $CODE
+            PLATFORM_GUID                  = $NEWGUID
+            PLATFORM_VERSION               = 0.1
+            DSC_SPECIFICATION              = 0x00010005
+            OUTPUT_DIRECTORY               = Build/${CODE}Pkg
+            SUPPORTED_ARCHITECTURES        = AARCH64
+            BUILD_TARGETS                  = DEBUG|RELEASE
+            SKUID_IDENTIFIER               = DEFAULT
+            FLASH_DEFINITION               = Platforms/$VENDOR/${CODE}Pkg/$CODE.fdf
+
+          !include Silicon/Qualcomm/${SOC}Pkg/${SOC}.dsc.inc
+
+          [LibraryClasses.common]
+            DeviceMemoryMapLib|Platforms/$VENDOR/${CODE}Pkg/Library/DeviceMemoryMapLib/DeviceMemoryMapLib.inf
+            DeviceConfigurationMapLib|Platforms/$VENDOR/${CODE}Pkg/Library/DeviceConfigurationMapLib/DeviceConfigurationMapLib.inf
+
+          [Components.common]
+            Platforms/$VENDOR/${CODE}Pkg/Library/DeviceMemoryMapLib/DeviceMemoryMapLib.inf
+            Platforms/$VENDOR/${CODE}Pkg/Library/DeviceConfigurationMapLib/DeviceConfigurationMapLib.inf
+          EOF
+
+            cat > "$NEW_PLAT/$CODE.fdf" <<EOF
+          [Defines]
+          !include Silicon/Qualcomm/${SOC}Pkg/${SOC}.fdf.inc
+          EOF
+
+            cat > "$NEW_PLAT/Library/DeviceMemoryMapLib/DeviceMemoryMapLib.inf" <<EOF
+          [Defines]
+            INF_VERSION    = 0x00010005
+            BASE_NAME      = DeviceMemoryMapLib
+            FILE_GUID      = $(uuidgen | tr a-z A-Z)
+            MODULE_TYPE    = BASE
+            VERSION_STRING = 1.0
+            LIBRARY_CLASS  = DeviceMemoryMapLib
+
+          [Sources.common]
+            DeviceMemoryMapLib.c
+
+          [Packages]
+            MdePkg/MdePkg.dec
+            Silicon/Qualcomm/${SOC}Pkg/${SOC}Pkg.dec
+          EOF
+
+            cat > "$NEW_PLAT/Library/DeviceMemoryMapLib/DeviceMemoryMapLib.c" <<'EOF'
+          #include <Library/BaseLib.h>
+          // Skeleton: silicium_port.py regenerates this from the device tree + uefiplat.cfg.
+          EOF
+
+            cat > "$NEW_PLAT/Library/DeviceConfigurationMapLib/DeviceConfigurationMapLib.inf" <<EOF
+          [Defines]
+            INF_VERSION    = 0x00010005
+            BASE_NAME      = DeviceConfigurationMapLib
+            FILE_GUID      = $(uuidgen | tr a-z A-Z)
+            MODULE_TYPE    = BASE
+            VERSION_STRING = 1.0
+            LIBRARY_CLASS  = DeviceConfigurationMapLib
+
+          [Sources.common]
+            DeviceConfigurationMapLib.c
+
+          [Packages]
+            MdePkg/MdePkg.dec
+            Silicon/Qualcomm/${SOC}Pkg/${SOC}Pkg.dec
+          EOF
+
+            cat > "$NEW_PLAT/Library/DeviceConfigurationMapLib/DeviceConfigurationMapLib.c" <<'EOF'
+          #include <Library/BaseLib.h>
+          // Skeleton: silicium_port.py regenerates this config map.
+          EOF
+
+            cat > "Resources/Configs/$CODE.conf" <<EOF
+          TARGET_DEVICE="$CODE"
+          TARGET_DEVICE_VENDOR="$VENDOR"
+          TARGET_SOC="$SOC"
+          EOF
+          fi
           echo "NEW_PLAT=$NEW_PLAT" >> "$GITHUB_ENV"
 
-      - name: Copy and rename the base SoC package
-        if: env.EXISTING != 'true'
+      # ---------- SoC PACKAGE: keep, copy the closest one, or scaffold a new one ----------
+      - name: Create SoC package dir (keep, copy or scaffold)
+        if: env.MODE != 'existing'
         run: |
-          OLDSOC=$(basename "$BASE_SOC" | sed 's/Pkg$//')
           NEW_SOC="Silicon/Qualcomm/${SOC}Pkg"
-          if [ -e "$NEW_SOC" ]; then echo "$NEW_SOC already exists, keeping it"; else
+          if [ -e "$NEW_SOC" ]; then
+            echo "$NEW_SOC already exists, keeping it"
+          elif [ -n "$BASE_SOC" ]; then
+            OLDSOC=$(basename "$BASE_SOC" | sed 's/Pkg$//')
             cp -r "$BASE_SOC" "$NEW_SOC"
             find "$NEW_SOC" -depth -name "*$OLDSOC*" | while read -r p; do
               mv "$p" "$(dirname "$p")/$(basename "$p" | sed "s/$OLDSOC/$SOC/g")"
             done
             grep -rIl "$OLDSOC" "$NEW_SOC" | xargs -r sed -i "s/$OLDSOC/$SOC/g"
+            grep -rIl "$OLDSOC" "$NEW_PLAT" | xargs -r sed -i "s/$OLDSOC/$SOC/g"
+            echo "copied SoC $OLDSOC -> $SOC" | tee -a port.log
+          else
+            echo "No similar SoC package: scaffolding $NEW_SOC from scratch" | tee -a port.log
+            mkdir -p "$NEW_SOC/Include" "$NEW_SOC/Library"
+            cat > "$NEW_SOC/${SOC}Pkg.dec" <<EOF
+          [Defines]
+            DEC_SPECIFICATION = 0x00010005
+            PACKAGE_NAME      = ${SOC}Pkg
+            PACKAGE_GUID      = $(uuidgen | tr a-z A-Z)
+            PACKAGE_VERSION   = 0.1
+
+          [Includes]
+            Include
+
+          [PcdsFixedAtBuild]
+            # GIC / timer / core-count PCDs get filled in by silicium_port.py
+          EOF
+            cat > "$NEW_SOC/${SOC}.dsc.inc" <<EOF
+          [PcdsFixedAtBuild.common]
+            # Filled in by silicium_port.py (GIC, timer, cores)
+          EOF
+            cat > "$NEW_SOC/${SOC}.fdf.inc" <<EOF
+          # Firmware volume layout for ${SOC}: fill in APRIORI/DXE/RAW order by hand (UEFITool).
+          EOF
           fi
-          grep -rIl "$OLDSOC" "$NEW_PLAT" | xargs -r sed -i "s/$OLDSOC/$SOC/g"
           echo "NEW_SOC=$NEW_SOC" >> "$GITHUB_ENV"
 
       - name: Place binaries and device tree
-        if: env.EXISTING != 'true'
+        if: env.MODE != 'existing'
         run: |
           mkdir -p "Binaries/$CODE" Resources/DTBs "$NEW_PLAT/FdtBlob"
           cp -r /tmp/xbl-out/. "Binaries/$CODE/"
@@ -209,7 +321,7 @@ jobs:
           cp port-input/device-tree.dtb "$NEW_PLAT/FdtBlob/$CODE.dtb"
 
       - name: Generate memory map, config map, SoC PCDs, FD values
-        if: env.EXISTING != 'true'
+        if: env.MODE != 'existing'
         run: |
           MM=$(find "$NEW_PLAT" -name DeviceMemoryMapLib.c | head -1)
           CM=$(find "$NEW_PLAT" -name DeviceConfigurationMapLib.c | head -1)
@@ -231,7 +343,7 @@ jobs:
       - name: Pack the generated tree
         if: always()
         run: |
-          tar czf kiev-port-tree.tgz \
+          tar czf "${CODE}-port-tree.tgz" \
             "Platforms/$VENDOR/${CODE}Pkg" "Silicon/Qualcomm/${SOC}Pkg" \
             "Resources/Configs/$CODE.conf" "Resources/DTBs/$CODE.dts" "Resources/DTBs/$CODE.dtb" \
             "Binaries/$CODE" port-report.md 2>/dev/null || true
@@ -245,6 +357,6 @@ jobs:
             mu/port-report.md
             mu/port.log
             mu/build.log
-            mu/kiev-port-tree.tgz
+            mu/*-port-tree.tgz
             mu/**/*.img
           retention-days: 14
